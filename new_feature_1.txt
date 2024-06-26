@@ -1,1 +1,166 @@
-new-feature_1
+Install all the packages
+!pip install -r requirements.txt
+Import required libraries
+import pandas as pd
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from optimum.bettertransformer import BetterTransformer
+import torch
+from tqdm import tqdm
+from name_processor import NameProcessor
+import os
+import boto3
+import yaml
+2024-06-10 08:36:43.470493: I tensorflow/core/platform/cpu_feature_guard.cc:210] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 AVX512F FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+2024-06-10 08:36:45.638614: W tensorflow/compiler/tf2tensorrt/utils/py_utils.cc:38] TF-TRT Warning: Could not find TensorRT
+Specify the input, input type, output, columns and model path
+# Load the configuration file
+with open('config.yaml', 'r') as file:
+    config = yaml.safe_load(file)
+​
+# Extract values from the config
+bucket_name = config['s3_artifacts']['bucket_name']
+model_s3_prefix = config['s3_artifacts']['model_root_path']
+input_path = config['data_paths']['input_path']
+input_type = config['data_paths']['input_type']
+output_path = config['data_paths']['output_path']
+input_columns = config['columns']['input_columns']
+if INPUT_TYPE == "csv":
+    input_reader = pd.read_csv
+elif INPUT_TYPE == "parquet":
+    input_reader = pd.read_parquet
+else:
+    raise ValueError(f"Unsupported input file type: {input_type}")
+​
+# Load the test data
+test_data = input_reader(input_path, usecols=input_columns)
+Download the finetuned model to local
+# Local path to store the model files
+local_model_dir = "./model"
+os.makedirs(local_model_dir, exist_ok=True)
+​
+# Initialize S3 client
+s3 = boto3.client('s3')
+​
+# List and download all files in the S3 model directory
+paginator = s3.get_paginator('list_objects_v2')
+pages = paginator.paginate(Bucket=bucket_name, Prefix=model_s3_prefix)
+​
+for page in pages:
+    for obj in page['Contents']:
+        key = obj['Key']
+        if key.endswith("/"):
+            continue
+        local_file_path = os.path.join(local_model_dir, os.path.basename(key))
+        s3.download_file(bucket_name, key, local_file_path)
+Load the Trained Model and Tokenizer
+# Load the trained model
+model = AutoModelForSequenceClassification.from_pretrained(local_model_dir)
+​
+# Optimize the model with BetterTransformer
+model = BetterTransformer.transform(model)
+​
+# Load the tokenizer
+tokenizer = AutoTokenizer.from_pretrained(local_model_dir)
+​
+# Move model to GPU if available
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+The BetterTransformer implementation does not support padding during training, as the fused kernels do not support attention masks. Beware that passing padded batched data during training may result in unexpected outputs. Please refer to https://huggingface.co/docs/optimum/bettertransformer/overview for more details.
+BertForSequenceClassification(
+  (bert): BertModel(
+    (embeddings): BertEmbeddings(
+      (word_embeddings): Embedding(250037, 384, padding_idx=0)
+      (position_embeddings): Embedding(512, 384)
+      (token_type_embeddings): Embedding(2, 384)
+      (LayerNorm): LayerNorm((384,), eps=1e-12, elementwise_affine=True)
+      (dropout): Dropout(p=0.1, inplace=False)
+    )
+    (encoder): BertEncoder(
+      (layer): ModuleList(
+        (0-11): 12 x BertLayerBetterTransformer(
+          (act_fn_callable): GELUActivation()
+        )
+      )
+    )
+    (pooler): BertPooler(
+      (dense): Linear(in_features=384, out_features=384, bias=True)
+      (activation): Tanh()
+    )
+  )
+  (dropout): Dropout(p=0.1, inplace=False)
+  (classifier): Linear(in_features=384, out_features=2, bias=True)
+)
+Preprocess the Name
+# Initialize the NameProcessor class
+name_processor = NameProcessor()
+​
+# Preprocess the names based on the country
+test_data['Processed_Name'] = test_data.apply(lambda row: name_processor.process_name(row['Name'], row['country']), axis=1)
+Prediction of gender
+# Function to predict gender and confidence score in batches
+def predict_gender_batch(names):
+    """
+    Predict the gender and confidence score for a batch of names.
+​
+    Args:
+        names (list of str): List of names to predict gender for.
+​
+    Returns:
+        list of tuple: List of tuples containing predicted gender labels and confidence scores.
+            Each tuple contains a predicted gender label ('M' or 'F') and a confidence score.
+    """
+    inputs = tokenizer.batch_encode_plus(
+        names,
+        add_special_tokens=True,
+        max_length=128,
+        padding=True,
+        return_tensors='pt',
+        truncation=True
+    )
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+    outputs = model(**inputs)
+    logits = outputs.logits
+    probabilities = torch.softmax(logits, dim=1)
+    predicted_labels = torch.argmax(logits, dim=1).cpu().tolist()
+    confidence_scores = probabilities.max(dim=1).values.cpu().tolist()
+    return list(zip(predicted_labels, confidence_scores))
+​
+# Predict in batches
+batch_size = test_data.shape[0]
+predictions = []
+​
+# Add tqdm progress bar
+for i in tqdm(range(0, len(test_data), batch_size), desc="Predicting gender"):
+    batch_names = test_data['Name'].iloc[i:i + batch_size].tolist()
+    batch_predictions = predict_gender_batch(batch_names)
+    predictions.extend(batch_predictions)
+​
+# Split predictions into two separate columns
+predicted_labels, confidence_scores = zip(*predictions)
+predicted_labels = [1 if label == 1 else 0 for label in predicted_labels]
+test_data['Predicted_Gender'] = predicted_labels
+test_data['Confidence_Score'] = confidence_scores
+​
+# Handle cases where the name is not predictable
+test_data.loc[test_data['Processed_Name'] == 'not predictable', 'Predicted_Gender'] = 'not predictable'
+test_data.loc[test_data['Processed_Name'] == 'not predictable', 'Confidence_Score'] = None
+Predicting gender: 100%|██████████| 1042/1042 [07:57<00:00,  2.18it/s]
+test_data
+test_data.head()
+Name	Gender	country
+0	Wanselambadaklase	1	Indonesia
+1	Warbukji	0	Indonesia
+2	Wardah S	0	Indonesia
+3	Wardhatuz	0	Indonesia
+4	Wargartkosongempat	1	Indonesia
+Calculate the accuracy
+true_gen
+# Accuracy
+true_gen = test_data['Gender']
+pred_gen = test_data['Predicted_Gender']
+print((true_gen==pred_gen).mean()*100)
+0.0
+Save the file
+# Save the DataFrame to S3
+test_data.to_csv(OUTPUT_PATH, index=False)
